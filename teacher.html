@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Prof — Cap sur les vacances</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  .wheel-wrap{position:relative; width:280px; height:280px; margin:0 auto;}
+  .pointer{position:absolute; top:-14px; left:50%; transform:translateX(-50%); width:0; height:0; border-left:16px solid transparent; border-right:16px solid transparent; border-top:26px solid var(--gold); z-index:5;}
+  .wheel-disc{width:100%; height:100%; border-radius:50%; border:6px solid var(--navy2); box-shadow:0 0 0 4px var(--gold), 0 10px 30px rgba(0,0,0,0.5); transition:transform 3s cubic-bezier(.17,.67,.12,1); display:flex; align-items:center; justify-content:center; background:conic-gradient(var(--teal) 0deg 90deg, var(--coral) 90deg 180deg, var(--gold) 180deg 270deg, #7A8FE0 270deg 360deg);}
+  .team-pick{display:flex; gap:10px; flex-wrap:wrap; justify-content:center;}
+  .team-pick button{padding:10px 18px; border-radius:12px; font-weight:800; color:#0F1E38;}
+  .team-pick button.active-pick{outline:3px solid #fff;}
+  .qr-hint{font-size:0.85rem; color:var(--muted); text-align:center;}
+</style>
+</head>
+<body>
+<div class="scoreboard" id="scoreboard"></div>
+<main><div class="screen" id="screen"></div></main>
+
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
+<script src="firebase-config.js"></script>
+<script src="questions.js"></script>
+<script>
+/* ============ STATE ============ */
+let roomCode = null;
+let sessionRef = null;
+let teams = {};       // live snapshot from DB {teamId: {name,color,score}}
+let answers = {};     // live snapshot from DB {teamId: {value,ts}}
+let broadcast = { game:null, phase:'idle', payload:{} };
+let used = { quiz:[], wheel:[], vf:[], estimation:[] };
+let screenName = 'setup';
+let wheelActiveTeam = null;
+let pendingRevealData = null; // holds current question data while answering (not yet in DB, kept local for reveal calc)
+
+function genCode(){
+  return Math.floor(1000 + Math.random()*9000).toString();
+}
+
+/* ============ RENDER: SCOREBOARD ============ */
+function renderScoreboard(){
+  const sb = document.getElementById('scoreboard');
+  let html = `<div class="brand">🎓 Cap sur les vacances — Prof</div>`;
+  if(roomCode){
+    html += `<div class="team-pill"><span class="tname">Code salle</span><span class="tscore">${roomCode}</span></div>`;
+  }
+  Object.values(teams).forEach((t,i)=>{
+    html += `<div class="team-pill">
+      <div class="team-dot" style="background:${t.color}">${i+1}</div>
+      <span class="tname">${t.name}</span>
+      <span class="tscore">${t.score||0} pts</span>
+    </div>`;
+  });
+  if(roomCode && screenName!=='setup'){
+    html += `<button class="topbar-btn" onclick="goHub()">🏠 Menu</button>`;
+  }
+  sb.innerHTML = html;
+}
+
+/* ============ FIREBASE WIRING ============ */
+function createSession(){
+  roomCode = genCode();
+  sessionRef = db.ref('sessions/'+roomCode);
+  sessionRef.set({
+    createdAt: Date.now(),
+    status: 'lobby',
+    broadcast: { game:null, phase:'idle', payload:{} },
+    used: { quiz:[], wheel:[], vf:[], estimation:[] }
+  }).then(()=>{
+    attachListeners();
+    screenName = 'lobby';
+    render();
+  });
+}
+function attachListeners(){
+  sessionRef.child('teams').on('value', snap=>{
+    teams = snap.val() || {};
+    renderScoreboard();
+    if(screenName==='lobby') render();
+  });
+  sessionRef.child('answers').on('value', snap=>{
+    answers = snap.val() || {};
+    if(screenName==='quiz' || screenName==='vf' || screenName==='estimation') render();
+  });
+  sessionRef.child('used').on('value', snap=>{
+    used = snap.val() || { quiz:[], wheel:[], vf:[], estimation:[] };
+  });
+}
+function pushBroadcast(game, phase, payload){
+  broadcast = {game, phase, payload};
+  sessionRef.child('broadcast').set(broadcast);
+}
+function clearAnswers(){
+  sessionRef.child('answers').set({});
+  answers = {};
+}
+function markUsed(game, idx){
+  used[game] = used[game]||[];
+  used[game].push(idx);
+  sessionRef.child('used/'+game).set(used[game]);
+}
+function resetUsed(game){
+  used[game] = [];
+  sessionRef.child('used/'+game).set([]);
+}
+function addScore(teamId, pts){
+  const current = (teams[teamId] && teams[teamId].score) || 0;
+  sessionRef.child('teams/'+teamId+'/score').set(current + pts);
+}
+
+/* ============ ROUTER ============ */
+function goHub(){
+  screenName='hub';
+  pushBroadcast(null, 'idle', {});
+  render();
+}
+function render(){
+  renderScoreboard();
+  const el = document.getElementById('screen');
+  if(screenName==='setup') el.innerHTML = renderSetup();
+  else if(screenName==='lobby') el.innerHTML = renderLobby();
+  else if(screenName==='hub') el.innerHTML = renderHub();
+  else if(screenName==='quiz') el.innerHTML = renderQuiz();
+  else if(screenName==='wheel') el.innerHTML = renderWheel();
+  else if(screenName==='vf') el.innerHTML = renderVF();
+  else if(screenName==='estimation') el.innerHTML = renderEstimation();
+  else if(screenName==='podium') el.innerHTML = renderPodium();
+}
+
+/* ============ SETUP / LOBBY ============ */
+function renderSetup(){
+  return `
+    <h1 class="title">Cap sur les <span>vacances</span> 🌞</h1>
+    <p class="subtitle">Créez la salle, partagez le code aux équipes, elles rejoignent depuis leur propre appareil sur la page "équipe".</p>
+    <button class="btn" onclick="createSession()">Créer la session</button>
+  `;
+}
+function renderLobby(){
+  const teamRows = Object.keys(teams).length
+    ? Object.values(teams).map(t=>`<div class="live-row"><span>${t.name}</span></div>`).join('')
+    : `<p class="progress-note">En attente que les équipes rejoignent…</p>`;
+  return `
+    <h1 class="title">Salle <span>${roomCode}</span></h1>
+    <p class="subtitle qr-hint">Donnez ce code aux équipes. Chacune ouvre la page "équipe" sur son appareil, saisit le code + son nom d'équipe.</p>
+    <div class="card"><div class="live-list">${teamRows}</div></div>
+    <button class="btn" onclick="goHub()" ${Object.keys(teams).length===0?'disabled':''}>Démarrer la séance ➜</button>
+  `;
+}
+
+/* ============ HUB ============ */
+function renderHub(){
+  return `
+    <h1 class="title">Choisissez un <span>jeu</span></h1>
+    <div class="hub-grid" style="display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:16px; width:100%;">
+      <button class="card" style="text-align:left; cursor:pointer;" onclick="startQuiz()"><h3>⚡ Quiz Éclair</h3><p class="progress-note">36 questions</p></button>
+      <button class="card" style="text-align:left; cursor:pointer;" onclick="startWheel()"><h3>🎡 Roue des Objections</h3><p class="progress-note">14 objections</p></button>
+      <button class="card" style="text-align:left; cursor:pointer;" onclick="startVF()"><h3>✅❌ Vrai/Faux Éclair</h3><p class="progress-note">24 affirmations</p></button>
+      <button class="card" style="text-align:left; cursor:pointer;" onclick="startEstimation()"><h3>🎯 Estimation Chiffrée</h3><p class="progress-note">10 défis</p></button>
+    </div>
+    <button class="btn secondary" onclick="screenName='podium'; pushBroadcast(null,'podium',{teams}); render();">🏆 Voir le podium</button>
+  `;
+}
+
+/* ============ QUIZ ============ */
+let currentQuizIdx = null;
+function startQuiz(){ screenName='quiz'; currentQuizIdx=null; nextQuizQuestion(); }
+function poolQuiz(){ return QUIZ.map((q,i)=>i).filter(i=>!(used.quiz||[]).includes(i)); }
+function nextQuizQuestion(){
+  const pool = poolQuiz();
+  currentQuizIdx = pool.length ? pool[Math.floor(Math.random()*pool.length)] : null;
+  clearAnswers();
+  if(currentQuizIdx!==null){
+    const q = QUIZ[currentQuizIdx];
+    pushBroadcast('quiz','question',{q:q.q, a:q.a, cat:q.cat});
+  } else {
+    pushBroadcast('quiz','done',{});
+  }
+  render();
+}
+function revealQuiz(){
+  const q = QUIZ[currentQuizIdx];
+  Object.entries(answers).forEach(([teamId,ans])=>{
+    if(ans && ans.value===q.correct) addScore(teamId,1);
+  });
+  markUsed('quiz', currentQuizIdx);
+  pushBroadcast('quiz','revealed',{q:q.q, a:q.a, cat:q.cat, correct:q.correct});
+  render();
+}
+function renderQuiz(){
+  const remaining = poolQuiz().length;
+  if(currentQuizIdx===null){
+    return `<h1 class="title">Quiz <span>Éclair</span></h1>
+      <div class="card" style="text-align:center;"><p class="progress-note">Toutes les questions sont passées 🎉</p>
+      <button class="btn secondary" onclick="resetUsed('quiz'); nextQuizQuestion();">Recommencer ce lot</button></div>
+      <button class="btn secondary" onclick="goHub()">← Menu</button>`;
+  }
+  const q = QUIZ[currentQuizIdx];
+  const answeredCount = Object.keys(answers).length;
+  const teamCount = Object.keys(teams).length;
+  const revealed = broadcast.phase==='revealed';
+  const answersHtml = q.a.map((ans,i)=>{
+    let cls='answer-btn disabled';
+    if(revealed) cls += (i===q.correct)?' correct':' wrong';
+    return `<div class="${cls}">${ans}</div>`;
+  }).join('');
+  return `
+    <h1 class="title">Quiz <span>Éclair</span></h1>
+    <div class="card">
+      <span class="qtag">${q.cat}</span>
+      <p class="question-text">${q.q}</p>
+      <div class="answers">${answersHtml}</div>
+      <p class="progress-note">${answeredCount}/${teamCount} équipes ont répondu</p>
+      <div class="btn-row" style="margin-top:14px;">
+        ${!revealed ? `<button class="btn coral" onclick="revealQuiz()">Révéler (attribue les points)</button>` : `<button class="btn" onclick="nextQuizQuestion()">Question suivante ➜</button>`}
+      </div>
+    </div>
+    <p class="progress-note">${remaining} question(s) restante(s)</p>
+    <button class="btn secondary" onclick="goHub()">← Menu</button>
+  `;
+}
+
+/* ============ VRAI/FAUX ============ */
+let currentVFIdx = null;
+function startVF(){ screenName='vf'; currentVFIdx=null; nextVFQuestion(); }
+function poolVF(){ return VF.map((v,i)=>i).filter(i=>!(used.vf||[]).includes(i)); }
+function nextVFQuestion(){
+  const pool = poolVF();
+  currentVFIdx = pool.length ? pool[Math.floor(Math.random()*pool.length)] : null;
+  clearAnswers();
+  if(currentVFIdx!==null){
+    pushBroadcast('vf','question',{s:VF[currentVFIdx].s});
+  } else {
+    pushBroadcast('vf','done',{});
+  }
+  render();
+}
+function revealVFq(){
+  const item = VF[currentVFIdx];
+  Object.entries(answers).forEach(([teamId,ans])=>{
+    if(ans && ans.value===item.v) addScore(teamId,1);
+  });
+  markUsed('vf', currentVFIdx);
+  pushBroadcast('vf','revealed',{s:item.s, v:item.v, expl:item.expl});
+  render();
+}
+function renderVF(){
+  const remaining = poolVF().length;
+  if(currentVFIdx===null){
+    return `<h1 class="title">Vrai/Faux <span>Éclair</span></h1>
+      <div class="card" style="text-align:center;"><p class="progress-note">Toutes les affirmations sont passées 🎉</p>
+      <button class="btn secondary" onclick="resetUsed('vf'); nextVFQuestion();">Recommencer ce lot</button></div>
+      <button class="btn secondary" onclick="goHub()">← Menu</button>`;
+  }
+  const item = VF[currentVFIdx];
+  const answeredCount = Object.keys(answers).length;
+  const teamCount = Object.keys(teams).length;
+  const revealed = broadcast.phase==='revealed';
+  return `
+    <h1 class="title">Vrai/Faux <span>Éclair</span></h1>
+    <div class="card" style="text-align:center;">
+      <p class="vf-statement" style="font-size:1.3rem; font-weight:700;">${item.s}</p>
+      ${revealed ? `<p class="progress-note" style="font-size:1rem; margin-top:10px;"><b style="color:var(--gold)">${item.v?'VRAI':'FAUX'}</b> — ${item.expl}</p>` : ''}
+      <p class="progress-note">${answeredCount}/${teamCount} équipes ont répondu</p>
+      <div class="btn-row" style="margin-top:14px;">
+        ${!revealed ? `<button class="btn coral" onclick="revealVFq()">Révéler (attribue les points)</button>` : `<button class="btn" onclick="nextVFQuestion()">Affirmation suivante ➜</button>`}
+      </div>
+    </div>
+    <p class="progress-note">${remaining} affirmation(s) restante(s)</p>
+    <button class="btn secondary" onclick="goHub()">← Menu</button>
+  `;
+}
+
+/* ============ ESTIMATION ============ */
+let currentEstIdx = null;
+function startEstimation(){ screenName='estimation'; currentEstIdx=null; nextEstQuestion(); }
+function poolEst(){ return ESTIMATION.map((e,i)=>i).filter(i=>!(used.estimation||[]).includes(i)); }
+function nextEstQuestion(){
+  const pool = poolEst();
+  currentEstIdx = pool.length ? pool[Math.floor(Math.random()*pool.length)] : null;
+  clearAnswers();
+  if(currentEstIdx!==null){
+    pushBroadcast('estimation','question',{q:ESTIMATION[currentEstIdx].q, unit:ESTIMATION[currentEstIdx].unit});
+  } else {
+    pushBroadcast('estimation','done',{});
+  }
+  render();
+}
+function revealEst(){
+  const item = ESTIMATION[currentEstIdx];
+  const ranked = Object.entries(answers)
+    .filter(([id,a])=>a && typeof a.value==='number')
+    .map(([id,a])=>({id, value:a.value, dist:Math.abs(a.value-item.answer)}))
+    .sort((a,b)=>a.dist-b.dist);
+  const pointsTable = [3,2,1];
+  ranked.forEach((r,i)=>{
+    if(pointsTable[i]) addScore(r.id, pointsTable[i]);
+  });
+  markUsed('estimation', currentEstIdx);
+  pushBroadcast('estimation','revealed',{
+    q:item.q, unit:item.unit, answer:item.answer, expl:item.expl,
+    ranking: ranked.map((r,i)=>({name:(teams[r.id]||{}).name||'?', value:r.value, pts:pointsTable[i]||0}))
+  });
+  render();
+}
+function renderEstimation(){
+  const remaining = poolEst().length;
+  if(currentEstIdx===null){
+    return `<h1 class="title">Estimation <span>Chiffrée</span></h1>
+      <div class="card" style="text-align:center;"><p class="progress-note">Tous les défis sont passés 🎉</p>
+      <button class="btn secondary" onclick="resetUsed('estimation'); nextEstQuestion();">Recommencer ce lot</button></div>
+      <button class="btn secondary" onclick="goHub()">← Menu</button>`;
+  }
+  const item = ESTIMATION[currentEstIdx];
+  const answeredCount = Object.keys(answers).length;
+  const teamCount = Object.keys(teams).length;
+  const revealed = broadcast.phase==='revealed';
+  let rankingHtml = '';
+  if(revealed){
+    const ranked = Object.entries(answers)
+      .filter(([id,a])=>a && typeof a.value==='number')
+      .map(([id,a])=>({name:(teams[id]||{}).name||'?', value:a.value, dist:Math.abs(a.value-item.answer)}))
+      .sort((a,b)=>a.dist-b.dist);
+    rankingHtml = `<div class="live-list" style="margin-top:14px;">` + ranked.map((r,i)=>
+      `<div class="live-row"><span>${i+1}. ${r.name}</span><span>${r.value} ${item.unit}</span></div>`
+    ).join('') + `</div>`;
+  }
+  return `
+    <h1 class="title">Estimation <span>Chiffrée</span></h1>
+    <div class="card" style="text-align:center;">
+      <p class="question-text">${item.q}</p>
+      ${revealed ? `<p class="progress-note" style="font-size:1rem;"><b style="color:var(--gold)">Réponse : ${item.answer} ${item.unit}</b> — ${item.expl}</p>${rankingHtml}` : ''}
+      <p class="progress-note">${answeredCount}/${teamCount} équipes ont répondu</p>
+      <div class="btn-row" style="margin-top:14px;">
+        ${!revealed ? `<button class="btn coral" onclick="revealEst()">Révéler (classement + points)</button>` : `<button class="btn" onclick="nextEstQuestion()">Défi suivant ➜</button>`}
+      </div>
+    </div>
+    <p class="progress-note">${remaining} défi(s) restant(s)</p>
+    <button class="btn secondary" onclick="goHub()">← Menu</button>
+  `;
+}
+
+/* ============ WHEEL ============ */
+function startWheel(){
+  screenName='wheel';
+  wheelActiveTeam = Object.keys(teams)[0] || null;
+  pushBroadcast('wheel','lobby',{});
+  render();
+}
+function poolWheel(){ return OBJECTIONS.map((o,i)=>i).filter(i=>!(used.wheel||[]).includes(i)); }
+function pickActiveTeam(teamId){ wheelActiveTeam = teamId; render(); }
+function spinWheelTeacher(){
+  const pool = poolWheel();
+  if(pool.length===0 || !wheelActiveTeam) return;
+  const idx = pool[Math.floor(Math.random()*pool.length)];
+  const disc = document.getElementById('teacherWheelDisc');
+  if(disc) disc.style.transform = `rotate(${360*4 + Math.random()*360}deg)`;
+  setTimeout(()=>{
+    markUsed('wheel', idx);
+    const timerEnd = Date.now() + 45000;
+    pushBroadcast('wheel','turn',{
+      activeTeamId: wheelActiveTeam,
+      activeTeamName: teams[wheelActiveTeam].name,
+      objection: OBJECTIONS[idx],
+      timerEnd
+    });
+    render();
+  }, 3100);
+}
+function scoreWheel(pts){
+  if(!wheelActiveTeam) return;
+  addScore(wheelActiveTeam, pts);
+  pushBroadcast('wheel','scored',{
+    activeTeamName: teams[wheelActiveTeam].name,
+    pts,
+    objection: (broadcast.payload && broadcast.payload.objection) || ''
+  });
+  render();
+}
+function nextWheelTurn(){
+  const teamIds = Object.keys(teams);
+  const idx = teamIds.indexOf(wheelActiveTeam);
+  wheelActiveTeam = teamIds[(idx+1)%teamIds.length] || null;
+  pushBroadcast('wheel','lobby',{});
+  render();
+}
+function renderWheel(){
+  const remaining = poolWheel().length;
+  const teamPicks = Object.entries(teams).map(([id,t])=>
+    `<button style="background:${t.color}; ${wheelActiveTeam===id?'outline:3px solid #fff;':''}" onclick="pickActiveTeam('${id}')">${t.name}</button>`
+  ).join('');
+
+  let body = '';
+  if(broadcast.phase==='turn'){
+    body = `
+      <div class="objection-reveal" style="text-align:center; font-size:1.3rem; font-weight:700; background:var(--navy3); padding:16px; border-radius:14px;">« ${broadcast.payload.objection} »</div>
+      <p class="progress-note">Équipe : <b style="color:var(--gold)">${broadcast.payload.activeTeamName}</b> — réponse en direct sur son appareil ou à l'oral</p>
+      <div id="wheelTimer" class="timer-display">45</div>
+      <div class="award-box" style="text-align:center;">
+        <p class="progress-note">Attribuer les points pour cette réponse :</p>
+        <div class="btn-row">
+          <button class="btn coral" onclick="scoreWheel(3)">+3 (excellente réponse)</button>
+          <button class="btn gold" onclick="scoreWheel(2)">+2 (correcte)</button>
+          <button class="btn secondary" onclick="scoreWheel(1)">+1 (a essayé)</button>
+          <button class="btn secondary" onclick="scoreWheel(0)">0</button>
+        </div>
+      </div>
+    `;
+  } else if(broadcast.phase==='scored'){
+    body = `
+      <div class="card" style="text-align:center;">
+        <p class="progress-note">${broadcast.payload.activeTeamName} a reçu <b style="color:var(--gold)">+${broadcast.payload.pts} pt(s)</b> pour : « ${broadcast.payload.objection} »</p>
+      </div>
+      <button class="btn" onclick="nextWheelTurn()">Équipe suivante ➜</button>
+    `;
+  } else {
+    body = `
+      <p class="progress-note">Choisissez l'équipe qui va tirer une objection :</p>
+      <div class="team-pick">${teamPicks}</div>
+      <div class="wheel-wrap"><div class="pointer"></div><div class="wheel-disc" id="teacherWheelDisc"></div></div>
+      <button class="btn coral" onclick="spinWheelTeacher()" ${remaining===0 || !wheelActiveTeam?'disabled':''}>${remaining===0?'Toutes les objections passées 🎉':'🎡 Tourner la roue'}</button>
+    `;
+  }
+  return `
+    <h1 class="title">La Roue des <span>Objections</span></h1>
+    ${body}
+    <p class="progress-note">${remaining} objection(s) restante(s)</p>
+    <button class="btn secondary" onclick="goHub()">← Menu</button>
+  `;
+}
+// mini timer refresher for teacher screen (visual only, scoring not time-gated)
+setInterval(()=>{
+  const el = document.getElementById('wheelTimer');
+  if(el && broadcast.phase==='turn' && broadcast.payload.timerEnd){
+    const remain = Math.max(0, Math.round((broadcast.payload.timerEnd - Date.now())/1000));
+    el.textContent = remain;
+    el.className = 'timer-display' + (remain<=10?' low':'');
+  }
+},1000);
+
+/* ============ PODIUM ============ */
+function renderPodium(){
+  const sorted = Object.values(teams).sort((a,b)=>(b.score||0)-(a.score||0));
+  const rows = sorted.map((t,i)=>{
+    const medal = i===0?'🥇':i===1?'🥈':i===2?'🥉':'—';
+    return `<div class="live-row"><span>${medal} ${t.name}</span><span style="color:var(--gold); font-weight:800;">${t.score||0} pts</span></div>`;
+  }).join('');
+  return `
+    <h1 class="title">🏆 Podium <span>final</span></h1>
+    <p class="subtitle">Bravo à toutes les équipes — bonnes vacances !</p>
+    <div class="card"><div class="live-list">${rows}</div></div>
+    <button class="btn secondary" onclick="goHub()">← Menu</button>
+  `;
+}
+
+/* ============ INIT ============ */
+render();
+</script>
+</body>
+</html>
