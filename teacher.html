@@ -38,14 +38,6 @@ let pendingRevealData = null; // holds current question data while answering (no
 function genCode(){
   return Math.floor(1000 + Math.random()*9000).toString();
 }
-function shuffle(arr){
-  const a = [...arr];
-  for(let i=a.length-1;i>0;i--){
-    const j = Math.floor(Math.random()*(i+1));
-    [a[i],a[j]]=[a[j],a[i]];
-  }
-  return a;
-}
 
 /* ============ RENDER: SCOREBOARD ============ */
 function renderScoreboard(){
@@ -172,8 +164,16 @@ function renderHub(){
 }
 
 /* ============ QUIZ ============ */
+function shuffleAnswers(answers, correctIdx){
+  const indexed = answers.map((text, i) => ({ text, isCorrect: i === correctIdx }));
+  for(let i = indexed.length - 1; i > 0; i--){
+    const j = Math.floor(Math.random() * (i + 1));
+    [indexed[i], indexed[j]] = [indexed[j], indexed[i]];
+  }
+  return { a: indexed.map(x => x.text), correct: indexed.findIndex(x => x.isCorrect) };
+}
 let currentQuizIdx = null;
-let currentQuizShuffled = null; // {choices:[...], correctIndex} — ordre mélangé pour CETTE diffusion
+let currentQuizShuffled = null;
 function startQuiz(){ screenName='quiz'; currentQuizIdx=null; nextQuizQuestion(); }
 function poolQuiz(){ return QUIZ.map((q,i)=>i).filter(i=>!(used.quiz||[]).includes(i)); }
 function nextQuizQuestion(){
@@ -182,13 +182,8 @@ function nextQuizQuestion(){
   clearAnswers();
   if(currentQuizIdx!==null){
     const q = QUIZ[currentQuizIdx];
-    // On mélange l'ordre des 4 réponses à chaque diffusion pour que la bonne
-    // réponse ne soit pas toujours à la même position.
-    const order = shuffle([0,1,2,3]);
-    const choices = order.map(origIdx=>q.a[origIdx]);
-    const correctIndex = order.indexOf(q.correct);
-    currentQuizShuffled = {choices, correctIndex};
-    pushBroadcast('quiz','question',{q:q.q, a:choices, cat:q.cat});
+    currentQuizShuffled = shuffleAnswers(q.a, q.correct);
+    pushBroadcast('quiz','question',{q:q.q, a:currentQuizShuffled.a, cat:q.cat});
   } else {
     currentQuizShuffled = null;
     pushBroadcast('quiz','done',{});
@@ -197,12 +192,12 @@ function nextQuizQuestion(){
 }
 function revealQuiz(){
   const q = QUIZ[currentQuizIdx];
-  const correctIndex = currentQuizShuffled.correctIndex;
+  const sh = currentQuizShuffled;
   Object.entries(answers).forEach(([teamId,ans])=>{
-    if(ans && ans.value===correctIndex) addScore(teamId,1);
+    if(ans && ans.value===sh.correct) addScore(teamId,1);
   });
   markUsed('quiz', currentQuizIdx);
-  pushBroadcast('quiz','revealed',{q:q.q, a:currentQuizShuffled.choices, cat:q.cat, correct:correctIndex});
+  pushBroadcast('quiz','revealed',{q:q.q, a:sh.a, cat:q.cat, correct:sh.correct});
   render();
 }
 function renderQuiz(){
@@ -214,14 +209,13 @@ function renderQuiz(){
       <button class="btn secondary" onclick="goHub()">← Menu</button>`;
   }
   const q = QUIZ[currentQuizIdx];
-  const choices = currentQuizShuffled.choices;
-  const correctIndex = currentQuizShuffled.correctIndex;
+  const sh = currentQuizShuffled || { a: q.a, correct: q.correct };
   const answeredCount = Object.keys(answers).length;
   const teamCount = Object.keys(teams).length;
   const revealed = broadcast.phase==='revealed';
-  const answersHtml = choices.map((ans,i)=>{
+  const answersHtml = sh.a.map((ans,i)=>{
     let cls='answer-btn disabled';
-    if(revealed) cls += (i===correctIndex)?' correct':' wrong';
+    if(revealed) cls += (i===sh.correct)?' correct':' wrong';
     return `<div class="${cls}">${ans}</div>`;
   }).join('');
   return `
